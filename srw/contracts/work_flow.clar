@@ -1,6 +1,7 @@
-;; Guardian Wallet
-;; Stage 2: Adding guardian system with multi-signature capabilities
-;; This contract implements a wallet with guardians who can collectively help the owner.
+;; Social Recovery Wallet
+;; Stage 3: Full implementation with social recovery capabilities
+;; This contract implements a wallet with social recovery capabilities.
+;; The wallet allows designating "guardians" who can collectively recover access if the owner loses their keys.
 
 ;; Define fungible token trait
 (define-trait ft-trait
@@ -18,13 +19,16 @@
 (define-constant ERR_NOT_INITIALIZED (err u102))
 (define-constant ERR_GUARDIAN_ALREADY_EXISTS (err u103))
 (define-constant ERR_GUARDIAN_DOESNT_EXIST (err u104))
-(define-constant ERR_OPERATION_IN_PROGRESS (err u105))
-(define-constant ERR_NO_OPERATION_IN_PROGRESS (err u106))
+(define-constant ERR_RECOVERY_IN_PROGRESS (err u105))
+(define-constant ERR_RECOVERY_NOT_IN_PROGRESS (err u106))
 (define-constant ERR_GUARDIAN_ALREADY_CONFIRMED (err u107))
 (define-constant ERR_INSUFFICIENT_CONFIRMATIONS (err u108))
-(define-constant ERR_OPERATION_EXPIRED (err u109))
+(define-constant ERR_RECOVERY_EXPIRED (err u109))
 (define-constant ERR_INSUFFICIENT_FUNDS (err u110))
 (define-constant ERR_INVALID_THRESHOLD (err u111))
+(define-constant ERR_ZERO_ADDRESS (err u112))
+(define-constant ERR_INVALID_AMOUNT (err u113))
+(define-constant ERR_INVALID_TOKEN (err u114))
 
 ;; Data variables
 
@@ -40,21 +44,21 @@
 ;; Total number of guardians
 (define-data-var guardian-count uint u0)
 
-;; Threshold required for actions (percentage 1-100)
-(define-data-var action-threshold uint u51)
+;; Threshold required for recovery (percentage 1-100)
+(define-data-var recovery-threshold uint u51)
 
-;; Operation state
-(define-data-var operation-in-progress bool false)
-(define-data-var operation-type (optional (string-ascii 20)) none)
-(define-data-var operation-proposed-by (optional principal) none)
-(define-data-var operation-payload (optional (buff 34)) none)
-(define-data-var operation-proposal-expiry uint u0)
-(define-map operation-confirmations principal bool)
-(define-data-var operation-confirmation-count uint u0)
+;; Recovery state
+(define-data-var recovery-in-progress bool false)
+(define-data-var recovery-proposed-by (optional principal) none)
+(define-data-var recovery-proposed-owner (optional principal) none)
+(define-data-var recovery-proposal-expiry uint u0)
+(define-map recovery-confirmations principal bool)
+(define-data-var recovery-confirmation-count uint u0)
 
 ;; Constants
 (define-constant SECONDS_IN_DAY u86400)
-(define-constant OPERATION_EXPIRY_DAYS u3)
+(define-constant RECOVERY_EXPIRY_DAYS u7)
+(define-constant ZERO_ADDRESS 'SP000000000000000000002Q6VF78)
 
 ;; Read-only functions
 
@@ -66,19 +70,18 @@
 (define-read-only (is-guardian (guardian principal))
   (default-to false (map-get? guardians guardian)))
 
-;; Get action threshold
-(define-read-only (get-action-threshold)
-  (var-get action-threshold))
+;; Get recovery threshold
+(define-read-only (get-recovery-threshold)
+  (var-get recovery-threshold))
 
-;; Check if an operation is in progress
-(define-read-only (operation-status)
+;; Check if recovery is in progress
+(define-read-only (recovery-status)
   {
-    in-progress: (var-get operation-in-progress),
-    operation-type: (var-get operation-type),
-    proposed-by: (var-get operation-proposed-by),
-    payload: (var-get operation-payload),
-    expiry: (var-get operation-proposal-expiry),
-    confirmations: (var-get operation-confirmation-count),
+    in-progress: (var-get recovery-in-progress),
+    proposed-by: (var-get recovery-proposed-by),
+    proposed-owner: (var-get recovery-proposed-owner),
+    expiry: (var-get recovery-proposal-expiry),
+    confirmations: (var-get recovery-confirmation-count),
     required-confirmations: (calculate-required-confirmations)
   })
 
@@ -87,7 +90,7 @@
   (let 
     (
       (guardian-total (var-get guardian-count))
-      (threshold (var-get action-threshold))
+      (threshold (var-get recovery-threshold))
     )
     (if (is-eq guardian-total u0)
       u0
@@ -105,13 +108,13 @@
     )
   ))
 
-;; Get the total number of guardians
-(define-read-only (get-guardian-count)
+;; Get the list of all guardians
+(define-read-only (get-guardians)
   (ok (var-get guardian-count)))
 
-;; Check if a guardian has confirmed an operation
-(define-read-only (has-confirmed-operation (guardian principal))
-  (default-to false (map-get? operation-confirmations guardian)))
+;; Check if a guardian has confirmed a recovery
+(define-read-only (has-confirmed-recovery (guardian principal))
+  (default-to false (map-get? recovery-confirmations guardian)))
 
 ;; Public functions
 
@@ -124,9 +127,12 @@
     ;; Validate threshold
     (asserts! (and (>= initial-threshold u1) (<= initial-threshold u100)) ERR_INVALID_THRESHOLD)
     
+    ;; Validate owner address
+    (asserts! (not (is-eq new-owner ZERO_ADDRESS)) ERR_ZERO_ADDRESS)
+    
     ;; Set owner and mark as initialized
     (var-set owner new-owner)
-    (var-set action-threshold initial-threshold)
+    (var-set recovery-threshold initial-threshold)
     (var-set initialized true)
     
     (ok true)))
@@ -139,6 +145,9 @@
     
     ;; Only owner can add guardians
     (asserts! (is-owner) ERR_UNAUTHORIZED)
+    
+    ;; Validate guardian address
+    (asserts! (not (is-eq guardian ZERO_ADDRESS)) ERR_ZERO_ADDRESS)
     
     ;; Check if guardian already exists
     (asserts! (not (is-guardian guardian)) ERR_GUARDIAN_ALREADY_EXISTS)
@@ -158,8 +167,8 @@
     ;; Only owner can remove guardians
     (asserts! (is-owner) ERR_UNAUTHORIZED)
     
-    ;; Check that no operation is in progress
-    (asserts! (not (var-get operation-in-progress)) ERR_OPERATION_IN_PROGRESS)
+    ;; Check that no recovery is in progress
+    (asserts! (not (var-get recovery-in-progress)) ERR_RECOVERY_IN_PROGRESS)
     
     ;; Check if guardian exists
     (asserts! (is-guardian guardian) ERR_GUARDIAN_DOESNT_EXIST)
@@ -170,8 +179,8 @@
     
     (ok true)))
 
-;; Change action threshold - only owner can change
-(define-public (set-action-threshold (new-threshold uint))
+;; Change recovery threshold - only owner can change
+(define-public (set-recovery-threshold (new-threshold uint))
   (begin
     ;; Check if contract is initialized
     (asserts! (var-get initialized) ERR_NOT_INITIALIZED)
@@ -183,104 +192,113 @@
     (asserts! (and (>= new-threshold u1) (<= new-threshold u100)) ERR_INVALID_THRESHOLD)
     
     ;; Set new threshold
-    (var-set action-threshold new-threshold)
+    (var-set recovery-threshold new-threshold)
     
     (ok true)))
 
-;; Propose a new operation - only guardians can propose
-(define-public (propose-operation (operation-id (string-ascii 20)) (payload (buff 34)))
+;; Initiate recovery process - only guardians can initiate
+(define-public (initiate-recovery (new-owner principal))
   (begin
     ;; Check if contract is initialized
     (asserts! (var-get initialized) ERR_NOT_INITIALIZED)
     
-    ;; Only guardians can propose operations
+    ;; Only guardians can initiate recovery
     (asserts! (is-guardian tx-sender) ERR_UNAUTHORIZED)
     
-    ;; Check that no operation is in progress
-    (asserts! (not (var-get operation-in-progress)) ERR_OPERATION_IN_PROGRESS)
+    ;; Check that no recovery is in progress
+    (asserts! (not (var-get recovery-in-progress)) ERR_RECOVERY_IN_PROGRESS)
     
-    ;; Set operation state
-    (var-set operation-in-progress true)
-    (var-set operation-type (some operation-id))
-    (var-set operation-proposed-by (some tx-sender))
-    (var-set operation-payload (some payload))
-    (var-set operation-proposal-expiry (+ block-height (* OPERATION_EXPIRY_DAYS SECONDS_IN_DAY)))
+    ;; Validate new owner address
+    (asserts! (not (is-eq new-owner ZERO_ADDRESS)) ERR_ZERO_ADDRESS)
+    
+    ;; Set recovery state
+    (var-set recovery-in-progress true)
+    (var-set recovery-proposed-by (some tx-sender))
+    (var-set recovery-proposed-owner (some new-owner))
+    (var-set recovery-proposal-expiry (+ block-height (* RECOVERY_EXPIRY_DAYS SECONDS_IN_DAY)))
     
     ;; Clear previous confirmations
-    (var-set operation-confirmation-count u0)
+    (var-set recovery-confirmation-count u0)
     
     ;; Add first confirmation
-    (map-set operation-confirmations tx-sender true)
-    (var-set operation-confirmation-count (+ (var-get operation-confirmation-count) u1))
+    (map-set recovery-confirmations tx-sender true)
+    (var-set recovery-confirmation-count (+ (var-get recovery-confirmation-count) u1))
     
     (ok true)))
 
-;; Confirm an operation - only guardians can confirm
-(define-public (confirm-operation)
+;; Confirm recovery - only guardians can confirm
+(define-public (confirm-recovery)
   (begin
     ;; Check if contract is initialized
     (asserts! (var-get initialized) ERR_NOT_INITIALIZED)
     
-    ;; Only guardians can confirm operations
+    ;; Only guardians can confirm recovery
     (asserts! (is-guardian tx-sender) ERR_UNAUTHORIZED)
     
-    ;; Check that an operation is in progress
-    (asserts! (var-get operation-in-progress) ERR_NO_OPERATION_IN_PROGRESS)
+    ;; Check that recovery is in progress
+    (asserts! (var-get recovery-in-progress) ERR_RECOVERY_NOT_IN_PROGRESS)
     
     ;; Check if guardian already confirmed
-    (asserts! (not (has-confirmed-operation tx-sender)) ERR_GUARDIAN_ALREADY_CONFIRMED)
+    (asserts! (not (has-confirmed-recovery tx-sender)) ERR_GUARDIAN_ALREADY_CONFIRMED)
     
-    ;; Check if operation period is still valid
-    (asserts! (<= block-height (var-get operation-proposal-expiry)) ERR_OPERATION_EXPIRED)
+    ;; Check if recovery period is still valid
+    (asserts! (<= block-height (var-get recovery-proposal-expiry)) ERR_RECOVERY_EXPIRED)
     
     ;; Add confirmation
-    (map-set operation-confirmations tx-sender true)
-    (var-set operation-confirmation-count (+ (var-get operation-confirmation-count) u1))
+    (map-set recovery-confirmations tx-sender true)
+    (var-set recovery-confirmation-count (+ (var-get recovery-confirmation-count) u1))
     
     (ok true)))
 
-;; Execute the operation if threshold is met
-(define-public (execute-operation)
+;; Execute recovery if threshold is met
+(define-public (execute-recovery)
   (begin
     ;; Check if contract is initialized
     (asserts! (var-get initialized) ERR_NOT_INITIALIZED)
     
-    ;; Check that an operation is in progress
-    (asserts! (var-get operation-in-progress) ERR_NO_OPERATION_IN_PROGRESS)
+    ;; Check that recovery is in progress
+    (asserts! (var-get recovery-in-progress) ERR_RECOVERY_NOT_IN_PROGRESS)
     
-    ;; Check if operation period is still valid
-    (asserts! (<= block-height (var-get operation-proposal-expiry)) ERR_OPERATION_EXPIRED)
+    ;; Check if recovery period is still valid
+    (asserts! (<= block-height (var-get recovery-proposal-expiry)) ERR_RECOVERY_EXPIRED)
     
     ;; Check if enough confirmations
-    (asserts! (>= (var-get operation-confirmation-count) (calculate-required-confirmations)) ERR_INSUFFICIENT_CONFIRMATIONS)
+    (asserts! (>= (var-get recovery-confirmation-count) (calculate-required-confirmations)) ERR_INSUFFICIENT_CONFIRMATIONS)
     
-    ;; Reset operation state
-    (var-set operation-in-progress false)
-    (var-set operation-type none)
-    (var-set operation-proposed-by none)
-    (var-set operation-payload none)
-    (var-set operation-confirmation-count u0)
+    ;; Get the proposed new owner and validate
+    (let ((new-owner (unwrap! (var-get recovery-proposed-owner) ERR_NOT_INITIALIZED)))
+      ;; Double-check the new owner is valid (extra safety)
+      (asserts! (not (is-eq new-owner ZERO_ADDRESS)) ERR_ZERO_ADDRESS)
+      
+      ;; Update owner
+      (var-set owner new-owner)
+      
+      ;; Reset recovery state
+      (var-set recovery-in-progress false)
+      (var-set recovery-proposed-by none)
+      (var-set recovery-proposed-owner none)
+      (var-set recovery-confirmation-count u0)
+    )
     
     (ok true)))
 
-;; Cancel an operation - only owner can cancel
-(define-public (cancel-operation)
+;; Cancel recovery - only owner can cancel
+(define-public (cancel-recovery)
   (begin
     ;; Check if contract is initialized
     (asserts! (var-get initialized) ERR_NOT_INITIALIZED)
     
-    ;; Only owner can cancel operations
+    ;; Only owner can cancel recovery
     (asserts! (is-owner) ERR_UNAUTHORIZED)
     
-    ;; Check that an operation is in progress
-    (asserts! (var-get operation-in-progress) ERR_NO_OPERATION_IN_PROGRESS)
+    ;; Check that recovery is in progress
+    (asserts! (var-get recovery-in-progress) ERR_RECOVERY_NOT_IN_PROGRESS)
     
-    ;; Reset operation state
-    (var-set operation-in-progress false)
-    (var-set operation-type none)
-    (var-set operation-proposed-by none)
-    (var-set operation-payload none)
-    (var-set operation-confirmation-count u0)
+    ;; Reset recovery state
+    (var-set recovery-in-progress false)
+    (var-set recovery-proposed-by none)
+    (var-set recovery-proposed-owner none)
+    (var-set recovery-confirmation-count u0)
     
     (ok true)))
 
@@ -292,6 +310,10 @@
     
     ;; Only owner can transfer
     (asserts! (is-owner) ERR_UNAUTHORIZED)
+    
+    ;; Validate recipient and amount
+    (asserts! (not (is-eq recipient ZERO_ADDRESS)) ERR_ZERO_ADDRESS)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     
     ;; Transfer tokens
     (contract-call? token transfer amount tx-sender recipient none)
@@ -305,6 +327,10 @@
     
     ;; Only owner can transfer
     (asserts! (is-owner) ERR_UNAUTHORIZED)
+    
+    ;; Validate recipient and amount
+    (asserts! (not (is-eq recipient ZERO_ADDRESS)) ERR_ZERO_ADDRESS)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     
     ;; Check if enough balance
     (asserts! (>= (stx-get-balance tx-sender) amount) ERR_INSUFFICIENT_FUNDS)
